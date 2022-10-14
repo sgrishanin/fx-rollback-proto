@@ -43,7 +43,7 @@ func LoadApp(cfgPrefix string, appProvider fx.Option, appConfigPtr interface{}) 
 	l := AppLoader{}
 
 	if err := l.createApp(cfgPrefix, appProvider, appConfigPtr); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to create app")
 	}
 
 	return &l, nil
@@ -53,13 +53,19 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 	l.cfg = &Config{
 		App: appConfigPtr,
 	}
-	if err := l.initLoaderConfigFromEnv(); err != nil {
+	err = l.initLoaderConfigFromEnv()
+	if err != nil {
 		return errors.Wrap(err, "failed to init loader config")
 	}
 
-	err = l.loadCurrentConfigFromEnv(cfgPrefix)
-	if err != nil {
-		return errors.Wrap(err, "failed to load current config from env")
+	if err := l.loadCurrentConfigFromEnv(cfgPrefix); err != nil {
+		if _, ok := unwrapBadConfigError(err); !ok {
+			return errors.Wrap(err, "failed to load current config from env")
+		}
+
+		if err := l.tryLoadFallbackConfig(); err != nil {
+			return errors.Wrap(err, "failed to load fallback config")
+		}
 	}
 
 	appOptions := fx.Options(
@@ -83,21 +89,14 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 		return errors.Wrap(err, "failed to create app with current config")
 	}
 
-	if l.cfg.LoaderConfig.IgnoreFallbackConfig {
-		return errors.New("failed to create app with current config and fallback config is ignored")
-	}
-
 	configError := err
-	err = l.loadLastKnownGoodConfig()
-	if err != nil {
+	if err := l.tryLoadFallbackConfig(); err != nil {
 		return errors.Wrap(err, "failed to fall back to last known good config")
 	}
-	l.cfg.UsesFallbackConfig = true
 	l.cfg.ConfigError = configError.Error()
 
 	l.app = fx.New(appOptions)
-	err = l.app.Err()
-	if err != nil {
+	if err := l.app.Err(); err != nil {
 		return errors.Wrap(err, "failed to create app with last known good config")
 	}
 
@@ -153,9 +152,24 @@ func (l *AppLoader) initLoaderConfigFromEnv() error {
 // todo абстрагировать этот код чтобы можно было грузить не только из env но и из других источников (ejm и тд)
 func (l *AppLoader) loadCurrentConfigFromEnv(appConfigPrefix string) error {
 	if err := envconfig.Process(appConfigPrefix, l.cfg.App); err != nil {
-		return err
+		parseErr := &envconfig.ParseError{}
+		if errors.As(err, &parseErr) {
+			return ErrBadConfig{Cause: err}
+		}
 	}
 	return nil
+}
+
+func (l *AppLoader) tryLoadFallbackConfig() error {
+	if l.cfg.IgnoreFallbackConfig {
+		return errors.New("fallback config is ignored")
+	}
+
+	if l.cfg.UsesFallbackConfig {
+		return errors.New("fallback config is already applied")
+	}
+
+	return l.loadLastKnownGoodConfig()
 }
 
 // загружает последний известный рабочий конфиг
@@ -171,6 +185,7 @@ func (l *AppLoader) loadLastKnownGoodConfig() error {
 	if err := gob.NewDecoder(f).Decode(l.cfg.App); err != nil {
 		return err
 	}
+	l.cfg.UsesFallbackConfig = true
 	return nil
 }
 
@@ -195,22 +210,26 @@ func (l *AppLoader) Config() Config {
 	return *l.cfg
 }
 
-// BadConfigError означает ошибку в конфиге.
+// ErrBadConfig означает ошибку в конфиге.
 // Возвращать ошибку должен сервис или резолвер fx, который проверяет семантическую корректность значений
-type BadConfigError struct {
+type ErrBadConfig struct {
 	Cause error
 }
 
-func (e BadConfigError) Error() string {
+func (e ErrBadConfig) Error() string {
 	return fmt.Sprintf("bad config: %s", e.Cause.Error())
 }
 
 func unwrapBadConfigError(err error) (error, bool) {
-	badConfigErr, ok := dig.RootCause(err).(BadConfigError)
-	if !ok {
-		return err, false
+	errBadConfig := &ErrBadConfig{}
+	if errors.As(err, &errBadConfig) {
+		return err, true
 	}
-	return badConfigErr, true
+	// fx врапает ошибки из резолверов в свои структуры, нужно получить исходную ошибку
+	if errBadConfig, ok := dig.RootCause(err).(ErrBadConfig); ok {
+		return errBadConfig, true
+	}
+	return err, false
 }
 
 // все что ниже - это пример приложения, которое запускается через AppLoader
@@ -261,11 +280,11 @@ func ProvideApp() fx.Option {
 			func(cfg SomeAppConfig, handler *echoHandler) (*echoServer, error) {
 				host := cfg.Server.Host
 				if host == "" {
-					return nil, BadConfigError{errors.New("server host can't be empty")}
+					return nil, ErrBadConfig{errors.New("server host can't be empty")}
 				}
 				port := cfg.Server.Port
 				if port > 8999 || port < 8000 {
-					return nil, BadConfigError{errors.New("server port should be between 8000 and 8999")}
+					return nil, ErrBadConfig{errors.New("server port should be between 8000 and 8999")}
 				}
 				addr := fmt.Sprintf("%s:%d", host, port)
 				return newEchoServer(addr, handler)
