@@ -221,13 +221,18 @@ func (l *AppLoader) Config() Config {
 }
 
 func (l *AppLoader) Start(ctx context.Context) error {
+	startErr := make(chan error)
+
 	go func() {
-		_ = l.app.Start(ctx)
+		startErr <- l.app.Start(ctx)
 	}()
 
-	<-l.app.Done()
-
-	return nil
+	select {
+	case err := <-startErr:
+		return err
+	case <-l.app.Done():
+		return nil
+	}
 }
 
 // ErrBadConfig означает ошибку в конфиге.
