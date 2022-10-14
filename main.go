@@ -75,7 +75,7 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 
 		// если случилась ошибка плохого конфига, пытаемся откатиться
 
-		if err := l.loadLastKnownGoodConfig(); err != nil {
+		if err := l.loadFallbackConfig(); err != nil {
 			return errors.Wrap(err, "failed to load fallback config")
 		}
 	}
@@ -115,15 +115,15 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 	// если мы уже откатились ранее (на моменте парсинга выше), будет возвращена ошибка
 
 	configError := err
-	if err := l.loadLastKnownGoodConfig(); err != nil {
-		return errors.Wrap(err, "failed to fall back to last known good config")
+	if err := l.loadFallbackConfig(); err != nil {
+		return errors.Wrap(err, "failed to load fallback config")
 	}
 	l.cfg.ConfigError = configError.Error()
 
 	l.app = fx.New(appOptions)
 	// если же даже с откатом не получилось запустить приложение - все, приехали
 	if err := l.app.Err(); err != nil {
-		return errors.Wrap(err, "failed to create app with last known good config")
+		return errors.Wrap(err, "failed to create app with fallback config")
 	}
 
 	if err := l.saveConfig(); err != nil {
@@ -169,7 +169,7 @@ func (l *AppLoader) loadCurrentConfigFromEnv(appConfigPrefix string) error {
 
 // загружает последний известный рабочий конфиг
 // todo абстрагировать для сохранения последнего хорошего конфига в etcd или куда-то еще
-func (l *AppLoader) loadLastKnownGoodConfig() error {
+func (l *AppLoader) loadFallbackConfig() error {
 	if l.cfg.IgnoreFallbackConfig {
 		return errors.New("fallback config is ignored")
 	}
@@ -178,10 +178,10 @@ func (l *AppLoader) loadLastKnownGoodConfig() error {
 		return errors.New("fallback config is already applied")
 	}
 
-	f, err := os.Open("last_known_good_config")
+	f, err := os.Open("fallback_config")
 	if err != nil {
 		if os.IsNotExist(err) {
-			return errors.New("last known good config does not exist")
+			return errors.New("fallback config does not exist")
 		}
 		return err
 	}
@@ -198,7 +198,7 @@ func (l *AppLoader) saveConfig() error {
 	if l.cfg.UsesFallbackConfig {
 		return nil
 	}
-	f, err := os.Create("last_known_good_config")
+	f, err := os.Create("fallback_config")
 	if err != nil {
 		return err
 	}
