@@ -15,8 +15,14 @@ import (
 	"time"
 )
 
-type ConfigProvider interface {
-	Config() Config
+func main() {
+	appLoader, err := LoadApp("APP", ProvideApp(), new(SomeAppConfig))
+	if err != nil {
+		panic(err)
+	}
+	if err := appLoader.Start(context.Background()); err != nil {
+		panic(err)
+	}
 }
 
 type AppLoader struct {
@@ -49,24 +55,33 @@ func LoadApp(cfgPrefix string, appProvider fx.Option, appConfigPtr interface{}) 
 	return &l, nil
 }
 
+// здесь содержится основная магия с попытками сборки приложения на разных конфигах
 func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfigPtr interface{}) (err error) {
 	l.cfg = &Config{
 		App: appConfigPtr,
 	}
+	// сначала грузим конфиги самого загрузчика
 	err = l.initLoaderConfigFromEnv()
 	if err != nil {
 		return errors.Wrap(err, "failed to init loader config")
 	}
 
+	// потом делаем попытку загрузить текущий конфиг.
+	// на этом этапе может быть либо ошибка парсинга конфига
 	if err := l.loadCurrentConfigFromEnv(cfgPrefix); err != nil {
 		if _, ok := unwrapBadConfigError(err); !ok {
 			return errors.Wrap(err, "failed to load current config from env")
 		}
 
-		if err := l.tryLoadFallbackConfig(); err != nil {
+		// если случилась ошибка плохого конфига, пытаемся откатиться
+
+		if err := l.loadLastKnownGoodConfig(); err != nil {
 			return errors.Wrap(err, "failed to load fallback config")
 		}
 	}
+
+	// имея какой-то конфиг, который мы смогли распарсить,
+	// пытаемся собрать с ним приложение в fx
 
 	appOptions := fx.Options(
 		fx.StartTimeout(l.cfg.StartTimeout),
@@ -79,7 +94,11 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 	)
 
 	l.app = fx.New(appOptions)
+
+	// если какой-то из резолверов кинул ошибку, она будет здесь
 	err = l.app.Err()
+
+	// если ошибки нет, можем спокойно выходить - приложение поднимется
 	if err == nil {
 		return nil
 	}
@@ -89,38 +108,20 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 		return errors.Wrap(err, "failed to create app with current config")
 	}
 
+	// если поняли, что это ошибка плохого конфига, пытаемся откатиться
+	// если мы уже откатились ранее (на моменте парсинга выше), будет возвращена ошибка
+
 	configError := err
-	if err := l.tryLoadFallbackConfig(); err != nil {
+	if err := l.loadLastKnownGoodConfig(); err != nil {
 		return errors.Wrap(err, "failed to fall back to last known good config")
 	}
 	l.cfg.ConfigError = configError.Error()
 
 	l.app = fx.New(appOptions)
+	// если же даже с откатом не получилось запустить приложение - все, приехали
 	if err := l.app.Err(); err != nil {
 		return errors.Wrap(err, "failed to create app with last known good config")
 	}
-
-	return nil
-}
-
-func (l *AppLoader) Start(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-
-	go func() {
-		if err := l.app.Start(ctx); err != nil {
-			cancel()
-		}
-	}()
-
-	if !l.cfg.UsesFallbackConfig {
-		if err := l.saveConfig(); err != nil {
-			cancel()
-			return errors.Wrap(err, "failed to save current config")
-		}
-	}
-
-	<-l.app.Done()
-	cancel()
 
 	return nil
 }
@@ -160,7 +161,9 @@ func (l *AppLoader) loadCurrentConfigFromEnv(appConfigPrefix string) error {
 	return nil
 }
 
-func (l *AppLoader) tryLoadFallbackConfig() error {
+// загружает последний известный рабочий конфиг
+// todo абстрагировать для сохранения последнего хорошего конфига в etcd или куда-то еще
+func (l *AppLoader) loadLastKnownGoodConfig() error {
 	if l.cfg.IgnoreFallbackConfig {
 		return errors.New("fallback config is ignored")
 	}
@@ -169,12 +172,6 @@ func (l *AppLoader) tryLoadFallbackConfig() error {
 		return errors.New("fallback config is already applied")
 	}
 
-	return l.loadLastKnownGoodConfig()
-}
-
-// загружает последний известный рабочий конфиг
-// todo абстрагировать для сохранения последнего хорошего конфига в etcd или куда-то еще
-func (l *AppLoader) loadLastKnownGoodConfig() error {
 	f, err := os.Open("last_known_good_config")
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -205,9 +202,35 @@ func (l *AppLoader) saveConfig() error {
 	return nil
 }
 
+type ConfigProvider interface {
+	Config() Config
+}
+
 // реализация ConfigProvider
 func (l *AppLoader) Config() Config {
 	return *l.cfg
+}
+
+func (l *AppLoader) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		if err := l.app.Start(ctx); err != nil {
+			cancel()
+		}
+	}()
+
+	if !l.cfg.UsesFallbackConfig {
+		if err := l.saveConfig(); err != nil {
+			cancel()
+			return errors.Wrap(err, "failed to save current config")
+		}
+	}
+
+	<-l.app.Done()
+	cancel()
+
+	return nil
 }
 
 // ErrBadConfig означает ошибку в конфиге.
@@ -234,29 +257,19 @@ func unwrapBadConfigError(err error) (error, bool) {
 
 // все что ниже - это пример приложения, которое запускается через AppLoader
 
-type echoServer struct {
-	lis     net.Listener
-	handler http.Handler
+// пример какого-то конфига, специфичного для приложения
+type SomeAppConfig struct {
+	EchoHandler EchoHandlerConfig `envconfig:"echo_handler" json:"echo_handler"`
+	Server      ServerConfig      `envconfig:"server" json:"server"`
 }
 
-func newEchoServer(addr string, handler http.Handler) (*echoServer, error) {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	s := echoServer{
-		lis:     lis,
-		handler: handler,
-	}
-	return &s, nil
+type EchoHandlerConfig struct {
+	ResponseTimeout time.Duration `envconfig:"response_timeout" json:"response_timeout"`
 }
 
-func (s *echoServer) Start(_ context.Context) error {
-	return http.Serve(s.lis, s.handler)
-}
-
-func (s *echoServer) Stop(_ context.Context) error {
-	return s.lis.Close()
+type ServerConfig struct {
+	Host string `envconfig:"host" json:"host"`
+	Port int    `envconfig:"port" json:"port"`
 }
 
 func ProvideApp() fx.Option {
@@ -302,19 +315,29 @@ func ProvideApp() fx.Option {
 	)
 }
 
-// пример какого-то конфига, специфичного для приложения
-type SomeAppConfig struct {
-	EchoHandler EchoHandlerConfig `envconfig:"echo_handler" json:"echo_handler"`
-	Server      ServerConfig      `envconfig:"server" json:"server"`
+type echoServer struct {
+	lis     net.Listener
+	handler http.Handler
 }
 
-type EchoHandlerConfig struct {
-	ResponseTimeout time.Duration `envconfig:"response_timeout"`
+func newEchoServer(addr string, handler http.Handler) (*echoServer, error) {
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	s := echoServer{
+		lis:     lis,
+		handler: handler,
+	}
+	return &s, nil
 }
 
-type ServerConfig struct {
-	Host string `envconfig:"host"`
-	Port int    `envconfig:"port"`
+func (s *echoServer) Start(_ context.Context) error {
+	return http.Serve(s.lis, s.handler)
+}
+
+func (s *echoServer) Stop(_ context.Context) error {
+	return s.lis.Close()
 }
 
 type echoHandler struct {
@@ -331,14 +354,4 @@ func (e *echoHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	_, _ = w.Write(b)
-}
-
-func main() {
-	appLoader, err := LoadApp("APP", ProvideApp(), new(SomeAppConfig))
-	if err != nil {
-		panic(err)
-	}
-	if err := appLoader.Start(context.Background()); err != nil {
-		panic(err)
-	}
 }
