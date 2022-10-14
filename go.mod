@@ -1,4 +1,4 @@
-module fx-rollback-test
+module github.com/sgrishanin/fx-rollback-proto
 
 go 1.16
 
