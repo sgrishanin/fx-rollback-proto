@@ -98,8 +98,11 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 	// если какой-то из резолверов кинул ошибку, она будет здесь
 	err = l.app.Err()
 
-	// если ошибки нет, можем спокойно выходить - приложение поднимется
+	// если ошибки нет, можем спокойно выходить, предварительно сохранив текущий конфиг
 	if err == nil {
+		if err := l.saveConfig(); err != nil {
+			return errors.Wrap(err, "failed to save current config")
+		}
 		return nil
 	}
 
@@ -123,6 +126,9 @@ func (l *AppLoader) createApp(cfgPrefix string, appProvider fx.Option, appConfig
 		return errors.Wrap(err, "failed to create app with last known good config")
 	}
 
+	if err := l.saveConfig(); err != nil {
+		return errors.Wrap(err, "failed to save current config")
+	}
 	return nil
 }
 
@@ -189,6 +195,9 @@ func (l *AppLoader) loadLastKnownGoodConfig() error {
 // сохраняет текущий конфиг
 // todo абстрагировать для сохранения последнего хорошего конфига в etcd или куда-то еще
 func (l *AppLoader) saveConfig() error {
+	if l.cfg.UsesFallbackConfig {
+		return nil
+	}
 	f, err := os.Create("last_known_good_config")
 	if err != nil {
 		return err
@@ -212,23 +221,11 @@ func (l *AppLoader) Config() Config {
 }
 
 func (l *AppLoader) Start(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-
 	go func() {
-		if err := l.app.Start(ctx); err != nil {
-			cancel()
-		}
+		_ = l.app.Start(ctx)
 	}()
 
-	if !l.cfg.UsesFallbackConfig {
-		if err := l.saveConfig(); err != nil {
-			cancel()
-			return errors.Wrap(err, "failed to save current config")
-		}
-	}
-
 	<-l.app.Done()
-	cancel()
 
 	return nil
 }
